@@ -72,11 +72,20 @@ sudo apt install -y \
   wget \
   pkg-config \
   libssl-dev \
-  libasound2-dev
+  libasound2-dev \
+  libx11-dev \
+  libxtst-dev
 ```
 
-**Fedora:**
+**Fedora / RHEL / CentOS:**
+For RHEL/CentOS, you first need to enable the **CRB** (CodeReady Builder) and **EPEL** repositories to access development headers:
+
 ```bash
+# RHEL 9 / Rocky Linux 9 / AlmaLinux 9
+sudo dnf config-manager --set-enabled crb
+sudo dnf install epel-release epel-next-release
+
+# Install Dependencies
 sudo dnf install \
   webkit2gtk4.1-devel \
   openssl-devel \
@@ -85,8 +94,12 @@ sudo dnf install \
   alsa-lib-devel \
   gcc \
   gcc-c++ \
-  make
+  make \
+  pkgconf-pkg-config \
+  libX11-devel \
+  libXtst-devel
 ```
+
 
 **Arch Linux:**
 ```bash
@@ -98,7 +111,9 @@ sudo pacman -S --needed \
   openssl \
   appindicator-gtk3 \
   librsvg \
-  alsa-lib
+  alsa-lib \
+  libx11 \
+  libxtst
 ```
 
 ### 2. Setup Karuda
