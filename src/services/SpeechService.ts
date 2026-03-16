@@ -29,7 +29,7 @@ export class SpeechService {
         this.onAutoStop = onAutoStop;
 
         // @ts-ignore
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition || window.mozSpeechRecognition || window.msSpeechRecognition;
         if (SpeechRecognition) {
             this.recognition = new SpeechRecognition();
             this.recognition.continuous = true;
@@ -207,8 +207,24 @@ export class SpeechService {
         }
     }
 
-    start() {
-        if (!this.recognition) return;
+    async start() {
+        if (!this.recognition) {
+            alert("Speech Recognition API is not supported in this browser.\nIf using Firefox, go to about:config and enable 'media.webspeech.recognition.enable'.");
+            this.onEnd(true);
+            return;
+        }
+
+        try {
+            // Firefox and some strict environments require an explicit getUserMedia call
+            // to trigger the microphone permission prompt before SpeechRecognition can begin.
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // Release the stream immediately since SpeechRecognition captures audio internally.
+            stream.getTracks().forEach(track => track.stop());
+        } catch (err) {
+            console.error("Microphone access denied or not available:", err);
+            this.onEnd(true);
+            return;
+        }
         
         this.isActive = true;
         this.fullTranscript = "";
