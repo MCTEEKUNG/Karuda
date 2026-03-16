@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Mic, Copy, Globe, Trash2, Settings, X, Minus, Palette, Code } from "lucide-react";
+import { Mic, Copy, Globe, Trash2, Settings, X, Minus, Palette, Code, History } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -14,7 +14,13 @@ const Overlay: React.FC = () => {
     const [aiProvider, setAiProvider] = useState<string>(() => localStorage.getItem("aiProvider") || "anthropic");
     const [showSettings, setShowSettings] = useState(false);
     const [isReadyToType, setIsReadyToType] = useState(false);
-    const [appMode, setAppMode] = useState<"dev" | "translate" | "design">("dev");
+    const [appMode, setAppMode] = useState<"dev" | "translate" | "design">(() => (localStorage.getItem("appMode") as any) || "dev");
+    const [showHistory, setShowHistory] = useState(false);
+
+    const [history, setHistory] = useState<{raw: string, refined: string, timestamp: number}[]>(() => {
+        const saved = localStorage.getItem("history");
+        return saved ? JSON.parse(saved).slice(0, 20) : [];
+    });
     const [toast, setToast] = useState<{message: string, type: 'success' | 'info'} | null>(null);
 
     const speechServiceRef = useRef<SpeechService | null>(null);
@@ -28,6 +34,11 @@ const Overlay: React.FC = () => {
         aiProviderRef.current = provider;
         localStorage.setItem("aiProvider", provider);
         setShowSettings(false);
+    };
+
+    const handleModeChange = (mode: "dev" | "translate" | "design") => {
+        setAppMode(mode);
+        localStorage.setItem("appMode", mode);
     };
 
     useEffect(() => {
@@ -194,6 +205,15 @@ const Overlay: React.FC = () => {
                 // 3. Automatic Submission (Single Prompt)
                 await invoke("press_enter");
                 
+                // 4. Save to History
+                const newHistory = [{
+                    raw: rawTextRef.current,
+                    refined: refinedText,
+                    timestamp: Date.now()
+                }, ...history].slice(0, 20);
+                setHistory(newHistory);
+                localStorage.setItem("history", JSON.stringify(newHistory));
+
                 setStatus("Done");
                 setTimeout(() => {
                     setStatus("Idle");
@@ -516,7 +536,7 @@ const Overlay: React.FC = () => {
                         {/* Mode Selector */}
                         <div className="mode-selector" style={{ display: 'flex', gap: '4px', marginLeft: '8px', paddingLeft: '8px', borderLeft: '1px solid rgba(255,255,255,0.05)' }}>
                             <button 
-                                onClick={(e) => { e.stopPropagation(); setAppMode("dev"); }} 
+                                onClick={(e) => { e.stopPropagation(); handleModeChange("dev"); }} 
                                 className={`icon-btn tool-btn ${appMode === "dev" ? 'active' : ''}`}
                                 style={{ 
                                     color: appMode === "dev" ? 'var(--accent-blue)' : 'var(--text-secondary)',
@@ -527,7 +547,7 @@ const Overlay: React.FC = () => {
                                 <Code size={18} />
                             </button>
                             <button 
-                                onClick={(e) => { e.stopPropagation(); setAppMode("translate"); }} 
+                                onClick={(e) => { e.stopPropagation(); handleModeChange("translate"); }} 
                                 className={`icon-btn tool-btn ${appMode === "translate" ? 'active' : ''}`}
                                 style={{ 
                                     color: appMode === "translate" ? 'var(--accent-blue)' : 'var(--text-secondary)',
@@ -538,7 +558,7 @@ const Overlay: React.FC = () => {
                                 <Globe size={18} />
                             </button>
                             <button 
-                                onClick={(e) => { e.stopPropagation(); setAppMode("design"); }} 
+                                onClick={(e) => { e.stopPropagation(); handleModeChange("design"); }} 
                                 className={`icon-btn tool-btn ${appMode === "design" ? 'active' : ''}`}
                                 style={{ 
                                     color: appMode === "design" ? 'var(--accent-blue)' : 'var(--text-secondary)',
@@ -551,8 +571,77 @@ const Overlay: React.FC = () => {
                         </div>
                     </div>
                     <div style={{ display: 'flex', gap: '4px', position: 'relative' }}>
+                        <button onClick={(e) => { e.stopPropagation(); setShowHistory(!showHistory); }} className={`icon-btn tool-btn ${showHistory ? 'active' : ''}`} title="History"><History size={18} /></button>
                         <button onClick={(e) => { e.stopPropagation(); clearAll(); }} className="icon-btn tool-btn" title="Clear"><Trash2 size={18} /></button>
                         <button onClick={(e) => { e.stopPropagation(); setShowSettings(!showSettings); }} className="icon-btn tool-btn" title="Settings"><Settings size={18} /></button>
+                        
+                        {showHistory && (
+                            <div style={{
+                                position: 'absolute',
+                                bottom: '100%',
+                                right: '0',
+                                marginBottom: '8px',
+                                background: 'rgba(20, 20, 28, 0.98)',
+                                backdropFilter: 'blur(30px)',
+                                WebkitBackdropFilter: 'blur(30px)',
+                                border: '1px solid rgba(255, 255, 255, 0.12)',
+                                borderRadius: '12px',
+                                padding: '12px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '8px',
+                                zIndex: 20,
+                                width: 'min(300px, 80vw)',
+                                maxHeight: '350px',
+                                overflowY: 'auto',
+                                boxShadow: '0 8px 32px rgba(0,0,0,0.8)'
+                            }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                                    <div style={{ fontSize: '10px', color: 'var(--accent-blue)', textTransform: 'uppercase', letterSpacing: '0.5px', fontWeight: 600 }}>Recent History</div>
+                                    <button 
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            setHistory([]);
+                                            localStorage.removeItem("history");
+                                        }}
+                                        style={{ background: 'transparent', border: 'none', color: 'var(--danger)', fontSize: '10px', cursor: 'pointer', opacity: 0.7 }}
+                                    >
+                                        Clear All
+                                    </button>
+                                </div>
+                                {history.length === 0 ? (
+                                    <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '12px', opacity: 0.6 }}>No history yet</div>
+                                ) : (
+                                    history.map((item, i) => (
+                                        <div 
+                                            key={item.timestamp} 
+                                            onClick={() => {
+                                                setRefinedText(item.refined);
+                                                setIsReadyToType(true);
+                                                setShowHistory(false);
+                                                setStatus("From History");
+                                            }}
+                                            style={{
+                                                padding: '8px',
+                                                borderRadius: '6px',
+                                                background: 'rgba(255,255,255,0.03)',
+                                                cursor: 'pointer',
+                                                border: '1px solid rgba(255,255,255,0.05)',
+                                                transition: 'all 0.2s'
+                                            }}
+                                            onMouseOver={(e) => (e.currentTarget.style.background = 'rgba(255,255,255,0.08)')}
+                                            onMouseOut={(e) => (e.currentTarget.style.background = 'rgba(255,255,255,0.03)')}
+                                        >
+                                            <div style={{ fontSize: '12px', color: 'white', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', lineHeight: 1.3 }}>{item.refined}</div>
+                                            <div style={{ fontSize: '9px', color: 'var(--text-secondary)', marginTop: '4px', display: 'flex', justifyContent: 'space-between' }}>
+                                                <span>{new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                                <span style={{ fontStyle: 'italic', opacity: 0.5 }}>{item.raw.slice(0, 15)}...</span>
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        )}
                         
                         {showSettings && (
                             <div style={{
