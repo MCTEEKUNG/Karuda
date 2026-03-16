@@ -35,7 +35,10 @@ Karuda is a sophisticated voice overlay application built with Tauri and React, 
 
 ## 🛠️ Requirements & Setup
 
+For a detailed walkthrough of system dependencies for **Windows, macOS, or Linux**, please see [INSTALL.md](./INSTALL.md).
+
 1. **Environment Variables**: Create a `.env` file in `src-tauri` with:
+
    ```env
    ANTHROPIC_API_KEY=your_key
    GOOGLE_API_KEY=your_key
