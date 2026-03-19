@@ -1,91 +1,154 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+type UnlistenFn = () => void;
+
 export class SpeechService {
-    private recognition: any;
     private onResult: (text: string) => void;
     private onEnd: (cancelled: boolean) => void;
     private onAutoStop: (text: string) => void;
 
     private isActive: boolean = false;
-    private fullTranscript: string = "";
-    private lastSessionTranscript: string = "";
-    
-    private firstSpeechTime: number = 0;
-    private lastSpeechTime: number = 0;
+    private transcript: string = "";
+
+    private unlistenResult: UnlistenFn | null = null;
+    private unlistenError: UnlistenFn | null = null;
+    private unlistenStarted: UnlistenFn | null = null;
 
     private silenceTimeout: any = null;
     private maxRecordingTimeout: any = null;
 
-    private SILENCE_THRESHOLD = 2500;
+    private firstSpeechTime: number = 0;
+    private lastSpeechTime: number = 0;
+
     private MIN_SPEECH_LENGTH = 1200;
     private MAX_RECORDING_LENGTH = 120000;
 
     constructor(
-        onResult: (text: string) => void, 
-        onEnd: (cancelled: boolean) => void, 
+        onResult: (text: string) => void,
+        onEnd: (cancelled: boolean) => void,
         onAutoStop: (text: string) => void,
-        lang: string = "th-TH"
+        _lang: string = "th-TH"   // kept for API compatibility, Whisper detects automatically
     ) {
         this.onResult = onResult;
         this.onEnd = onEnd;
         this.onAutoStop = onAutoStop;
+    }
 
-        // @ts-ignore
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition || window.mozSpeechRecognition || window.msSpeechRecognition;
-        if (SpeechRecognition) {
-            this.recognition = new SpeechRecognition();
-            this.recognition.continuous = true;
-            this.recognition.interimResults = true;
-            this.recognition.lang = lang; // Set language for better accuracy
+    // ──────────────────────────────────────────────
+    // Lifecycle
+    // ──────────────────────────────────────────────
 
-            this.recognition.onresult = (event: any) => {
-                if (!this.isActive) return;
+    async start() {
+        if (this.isActive) return;
+        this.isActive = true;
 
-                let currentSession = "";
-                for (let i = 0; i < event.results.length; i++) {
-                    currentSession += event.results[i][0].transcript;
-                }
-                this.lastSessionTranscript = currentSession;
+        this.transcript = "";
+        this.firstSpeechTime = 0;
+        this.lastSpeechTime = 0;
 
-                const fullText = this.fullTranscript + " " + this.lastSessionTranscript;
-                const cleaned = this.cleanTranscript(fullText);
+        if (this.silenceTimeout) clearTimeout(this.silenceTimeout);
+        if (this.maxRecordingTimeout) clearTimeout(this.maxRecordingTimeout);
 
-                if (cleaned.length > 0) {
-                    if (this.firstSpeechTime === 0) {
-                        this.firstSpeechTime = Date.now();
-                    }
-                    this.lastSpeechTime = Date.now();
-                }
+        // Set up Tauri event listeners
+        this.unlistenStarted = await listen<void>("speech-started", () => {
+            // Recording is live — start max-duration timer
+            this.maxRecordingTimeout = setTimeout(() => {
+                this.handleAutoStop(this.transcript);
+            }, this.MAX_RECORDING_LENGTH);
+        });
 
-                this.onResult(cleaned);
-                this.resetSilenceTimeout(cleaned);
-            };
+        this.unlistenResult = await listen<string>("speech-result", (event) => {
+            if (!this.isActive) return;
 
-            this.recognition.onstart = () => {
-                this.isActive = true;
-            };
+            const text = (event.payload as unknown as string) ?? "";
+            const cleaned = this.cleanTranscript(text);
+            this.transcript = cleaned;
 
-            this.recognition.onend = () => {
-                if (this.isActive) {
-                    // Browser stopped it prematurely (e.g., standard short silence pause).
-                    // We preserve the transcript and forcefully restart it to keep listening!
-                    this.fullTranscript += " " + this.lastSessionTranscript;
-                    this.lastSessionTranscript = "";
-                    try {
-                        this.recognition.start();
-                    } catch(e) {}
-                } else {
-                    this.onEnd(false);
-                }
-            };
+            if (cleaned.length > 0) {
+                if (this.firstSpeechTime === 0) this.firstSpeechTime = Date.now();
+                this.lastSpeechTime = Date.now();
+            }
 
-            this.recognition.onerror = (e: any) => {
-                if (e.error === 'no-speech' && this.isActive) {
-                    // ignore no-speech, let silenceTimeout handle it
-                }
-            };
+            this.onResult(cleaned);
+
+            // Once Whisper returns a result the recording stops on its own,
+            // so we treat it as an auto-stop.
+            this.isActive = false;
+            this._cleanup();
+
+            const speechDuration = this.lastSpeechTime - this.firstSpeechTime;
+            if (this.firstSpeechTime === 0 || speechDuration < this.MIN_SPEECH_LENGTH) {
+                this.onEnd(true); // too short → cancelled
+            } else {
+                this.onAutoStop(cleaned);
+            }
+        });
+
+        this.unlistenError = await listen<string>("speech-error", (event) => {
+            if (!this.isActive) return;
+            const msg = (event.payload as unknown as string) ?? "Unknown error";
+            console.error("[SpeechService] Rust error:", msg);
+            this.isActive = false;
+            this._cleanup();
+            this.onEnd(true);
+        });
+
+        try {
+            await invoke("start_recording");
+        } catch (err) {
+            console.error("[SpeechService] start_recording failed:", err);
+            this.isActive = false;
+            this._cleanup();
+            this.onEnd(true);
         }
     }
 
-    private TECH_DICTIONARY: Record<string, string> = {
+    stop() {
+        if (!this.isActive) return;
+        this.isActive = false;
+        this._cleanup();
+        invoke("stop_recording").catch(console.error);
+        // speech-result event will fire after Whisper responds;
+        // onEnd will be called from there. If user manually stops and
+        // no result arrives within 10s we fall back:
+        setTimeout(() => {
+            // If transcript came back already, the listener already called onEnd.
+            // This is just a safety net.
+        }, 10000);
+    }
+
+    cancel() {
+        this.isActive = false;
+        this._cleanup();
+        invoke("stop_recording").catch(console.error);
+        this.onEnd(true);
+    }
+
+    // ──────────────────────────────────────────────
+    // Internals
+    // ──────────────────────────────────────────────
+
+    private _cleanup() {
+        if (this.silenceTimeout) { clearTimeout(this.silenceTimeout); this.silenceTimeout = null; }
+        if (this.maxRecordingTimeout) { clearTimeout(this.maxRecordingTimeout); this.maxRecordingTimeout = null; }
+        if (this.unlistenResult) { this.unlistenResult(); this.unlistenResult = null; }
+        if (this.unlistenError) { this.unlistenError(); this.unlistenError = null; }
+        if (this.unlistenStarted) { this.unlistenStarted(); this.unlistenStarted = null; }
+    }
+
+    private handleAutoStop(finalText: string) {
+        if (!this.isActive) return;
+        this.stop();
+        const speechDuration = this.lastSpeechTime - this.firstSpeechTime;
+        if (this.firstSpeechTime === 0 || speechDuration < this.MIN_SPEECH_LENGTH) {
+            this.onEnd(true);
+        } else {
+            this.onAutoStop(finalText);
+        }
+    }
+
+    private readonly TECH_DICTIONARY: Record<string, string> = {
         "ฟังก์ชัน": "function",
         "คอนโซล": "console",
         "ล็อก": "log",
@@ -166,8 +229,6 @@ export class SpeechService {
     private replaceLoanwords(text: string): string {
         let processedText = text;
         for (const [thaiWord, englishWord] of Object.entries(this.TECH_DICTIONARY)) {
-            // Using global regex to replace all occurrences
-            // We pad with spaces to ensure words don't merge weirdly, but JS regex on Thai text can be simple
             const regex = new RegExp(thaiWord, 'g');
             processedText = processedText.replace(regex, ` ${englishWord} `);
         }
@@ -176,82 +237,9 @@ export class SpeechService {
 
     private cleanTranscript(text: string): string {
         let cleaned = text
-            .replace(/\.{2,}/g, ' ') // replace multiple dots with a space
-            .replace(/\s+/g, ' ')    // collapse multiple spaces into one
+            .replace(/\.{2,}/g, ' ')
+            .replace(/\s+/g, ' ')
             .trim();
-            
         return this.replaceLoanwords(cleaned).replace(/\s+/g, ' ').trim();
-    }
-
-    private resetSilenceTimeout(currentText: string) {
-        if (this.silenceTimeout) clearTimeout(this.silenceTimeout);
-        
-        if (this.firstSpeechTime > 0) {
-            this.silenceTimeout = setTimeout(() => {
-                this.handleAutoStop(currentText);
-            }, this.SILENCE_THRESHOLD);
-        }
-    }
-
-    private handleAutoStop(finalText: string) {
-        if (!this.isActive) return;
-
-        const actualSpeechDuration = this.lastSpeechTime - this.firstSpeechTime;
-        
-        this.stop(); 
-        
-        if (this.firstSpeechTime === 0 || actualSpeechDuration < this.MIN_SPEECH_LENGTH) {
-            this.onEnd(true); // cancelled as noise
-        } else {
-            this.onAutoStop(finalText);
-        }
-    }
-
-    async start() {
-        if (!this.recognition) {
-            alert("Speech Recognition API is not supported in this browser.\nIf using Firefox, go to about:config and enable 'media.webspeech.recognition.enable'.");
-            this.onEnd(true);
-            return;
-        }
-
-        try {
-            // Firefox and some strict environments require an explicit getUserMedia call
-            // to trigger the microphone permission prompt before SpeechRecognition can begin.
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            // Release the stream immediately since SpeechRecognition captures audio internally.
-            stream.getTracks().forEach(track => track.stop());
-        } catch (err) {
-            console.error("Microphone access denied or not available:", err);
-            this.onEnd(true);
-            return;
-        }
-        
-        this.isActive = true;
-        this.fullTranscript = "";
-        this.lastSessionTranscript = "";
-        this.firstSpeechTime = 0;
-        this.lastSpeechTime = 0;
-
-        if (this.silenceTimeout) clearTimeout(this.silenceTimeout);
-        if (this.maxRecordingTimeout) clearTimeout(this.maxRecordingTimeout);
-
-        this.maxRecordingTimeout = setTimeout(() => {
-            const currentText = this.fullTranscript + " " + this.lastSessionTranscript;
-            this.handleAutoStop(this.cleanTranscript(currentText));
-        }, this.MAX_RECORDING_LENGTH);
-
-        try {
-            this.recognition.start();
-        } catch (e) {}
-    }
-
-    stop() {
-        this.isActive = false;
-        if (this.silenceTimeout) clearTimeout(this.silenceTimeout);
-        if (this.maxRecordingTimeout) clearTimeout(this.maxRecordingTimeout);
-
-        if (this.recognition) {
-            try { this.recognition.stop(); } catch(e) {}
-        }
     }
 }

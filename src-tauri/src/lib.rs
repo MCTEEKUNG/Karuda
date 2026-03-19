@@ -4,6 +4,28 @@ use tauri::{Manager, Emitter};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use serde_json::json;
 
+// --- Recording State ---
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct RecordingState {
+    is_recording: Arc<AtomicBool>,
+    stop_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+}
+
+impl Default for RecordingState {
+    fn default() -> Self {
+        Self {
+            is_recording: Arc::new(AtomicBool::new(false)),
+            stop_tx: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Existing commands
+// ─────────────────────────────────────────────────────────────
+
 #[tauri::command]
 fn type_text(text: String) {
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
@@ -35,6 +57,235 @@ fn request_focus(handle: tauri::AppHandle) {
         let _ = window.set_focus();
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+// Native Speech Recording (cpal + Whisper API)
+// ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn start_recording(
+    state: tauri::State<'_, RecordingState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::sync::mpsc;
+
+    if state.is_recording.load(Ordering::SeqCst) {
+        return Err("Already recording".into());
+    }
+    state.is_recording.store(true, Ordering::SeqCst);
+
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    {
+        let mut lock = state.stop_tx.lock().unwrap();
+        *lock = Some(stop_tx);
+    }
+
+    let is_recording = Arc::clone(&state.is_recording);
+    let app_clone = app.clone();
+
+    std::thread::spawn(move || {
+        let host = cpal::default_host();
+        let device = match host.default_input_device() {
+            Some(d) => d,
+            None => {
+                let _ = app_clone.emit("speech-error", "No input device found");
+                is_recording.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        let config = match device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app_clone.emit("speech-error", format!("Config error: {}", e));
+                is_recording.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        let sample_rate = config.sample_rate().0;
+        let channels = config.channels() as u16;
+
+        let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let samples_clone = Arc::clone(&samples);
+
+        let stream_result = match config.sample_format() {
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                &config.into(),
+                move |data: &[f32], _| {
+                    let mut s = samples_clone.lock().unwrap();
+                    s.extend_from_slice(data);
+                },
+                |e| eprintln!("Stream error: {}", e),
+                None,
+            ),
+            cpal::SampleFormat::I16 => {
+                let samples_clone2 = Arc::clone(&samples);
+                device.build_input_stream(
+                    &config.into(),
+                    move |data: &[i16], _| {
+                        let mut s = samples_clone2.lock().unwrap();
+                        for &sample in data {
+                            s.push(sample as f32 / i16::MAX as f32);
+                        }
+                    },
+                    |e| eprintln!("Stream error: {}", e),
+                    None,
+                )
+            },
+            cpal::SampleFormat::U16 => {
+                let samples_clone3 = Arc::clone(&samples);
+                device.build_input_stream(
+                    &config.into(),
+                    move |data: &[u16], _| {
+                        let mut s = samples_clone3.lock().unwrap();
+                        for &sample in data {
+                            s.push((sample as f32 / u16::MAX as f32) * 2.0 - 1.0);
+                        }
+                    },
+                    |e| eprintln!("Stream error: {}", e),
+                    None,
+                )
+            },
+            _ => {
+                let _ = app_clone.emit("speech-error", "Unsupported sample format");
+                is_recording.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        let stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = app_clone.emit("speech-error", format!("Stream build error: {}", e));
+                is_recording.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        if let Err(e) = stream.play() {
+            let _ = app_clone.emit("speech-error", format!("Stream play error: {}", e));
+            is_recording.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let _ = app_clone.emit("speech-started", ());
+
+        // Wait for stop signal or timeout (max 120s)
+        let timeout = std::time::Duration::from_secs(120);
+        let _ = stop_rx.recv_timeout(timeout);
+
+        drop(stream);
+        is_recording.store(false, Ordering::SeqCst);
+
+        // --- Write WAV to temp file ---
+        let recorded_samples = samples.lock().unwrap().clone();
+        if recorded_samples.is_empty() {
+            let _ = app_clone.emit("speech-result", "");
+            return;
+        }
+
+        let temp_path = std::env::temp_dir().join("karuda_recording.wav");
+        {
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = match hound::WavWriter::create(&temp_path, spec) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = app_clone.emit("speech-error", format!("WAV write error: {}", e));
+                    return;
+                }
+            };
+            for sample in &recorded_samples {
+                let s = (sample * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                let _ = writer.write_sample(s);
+            }
+        }
+
+        // --- Send WAV to Whisper API ---
+        let api_key = match std::env::var("OPENAI_API_KEY") {
+            Ok(k) => k,
+            Err(_) => {
+                let _ = app_clone.emit("speech-error", "OPENAI_API_KEY not set in .env");
+                return;
+            }
+        };
+
+        let app_for_async = app_clone.clone();
+        let temp_path_clone = temp_path.clone();
+
+        // Use a new tokio runtime for the async HTTP call from this sync thread
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let wav_bytes = match tokio::fs::read(&temp_path_clone).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = app_for_async.emit("speech-error", format!("File read error: {}", e));
+                    return;
+                }
+            };
+
+            let part = reqwest::multipart::Part::bytes(wav_bytes)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .unwrap();
+
+            let form = reqwest::multipart::Form::new()
+                .text("model", "whisper-1")
+                .text("language", "th")
+                .part("file", part);
+
+            let client = reqwest::Client::new();
+            let res = client
+                .post("https://api.openai.com/v1/audio/transcriptions")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .multipart(form)
+                .send()
+                .await;
+
+            match res {
+                Ok(r) => {
+                    let body: serde_json::Value = r.json().await.unwrap_or_default();
+                    let text = body["text"].as_str().unwrap_or("").to_string();
+                    let _ = app_for_async.emit("speech-result", text);
+                }
+                Err(e) => {
+                    let _ = app_for_async.emit("speech-error", format!("Whisper API error: {}", e));
+                }
+            }
+
+            // Cleanup temp file
+            let _ = tokio::fs::remove_file(&temp_path_clone).await;
+        });
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_recording(state: tauri::State<'_, RecordingState>) -> Result<(), String> {
+    if !state.is_recording.load(Ordering::SeqCst) {
+        return Ok(()); // Not recording, nothing to do
+    }
+    let mut lock = state.stop_tx.lock().unwrap();
+    if let Some(tx) = lock.take() {
+        let _ = tx.send(());
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+// AI Prompt Processing
+// ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn process_ai_prompt(transcript: String, provider: Option<String>, mode: Option<String>) -> Result<String, String> {
@@ -176,11 +427,16 @@ async fn process_ai_prompt(transcript: String, provider: Option<String>, mode: O
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// App Entry Point
+// ─────────────────────────────────────────────────────────────
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = dotenvy::dotenv();
     
     tauri::Builder::default()
+        .manage(RecordingState::default())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -220,7 +476,11 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![type_text, erase_text, press_enter, request_focus, process_ai_prompt])
+        .invoke_handler(tauri::generate_handler![
+            type_text, erase_text, press_enter, request_focus,
+            process_ai_prompt,
+            start_recording, stop_recording
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

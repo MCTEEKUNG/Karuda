@@ -44,17 +44,9 @@ const Overlay: React.FC = () => {
     useEffect(() => {
         speechServiceRef.current = new SpeechService(
             (text) => {
+                // Whisper returns the full final transcript — no interim/live results.
                 setRawText(text);
                 rawTextRef.current = text;
-
-                // Live typing logic - only type if recording and not cancelled
-                if (isRecordingRef.current) {
-                    const newChars = text.slice(lastTypedCountRef.current);
-                    if (newChars.length > 0) {
-                        invoke("type_text", { text: newChars });
-                        lastTypedCountRef.current = text.length;
-                    }
-                }
             },
             (wasCancelled) => {
                 setIsRecording(false);
@@ -129,7 +121,7 @@ const Overlay: React.FC = () => {
     }, [isReadyToType, refinedText]);
 
     const cancelRecording = () => {
-        speechServiceRef.current?.stop();
+        (speechServiceRef.current as any)?.cancel?.() || speechServiceRef.current?.stop();
         setIsRecording(false);
         isRecordingRef.current = false;
         setStatus("Idle");
@@ -148,16 +140,30 @@ const Overlay: React.FC = () => {
         setIsReadyToType(false);
         lastTypedCountRef.current = 0;
         setStatus("Listening...");
-        speechServiceRef.current?.start();
+        speechServiceRef.current?.start().catch((err: any) => {
+            console.error("start() error:", err);
+            setIsRecording(false);
+            isRecordingRef.current = false;
+            setStatus("Idle");
+        });
     };
 
     const stopRecording = async (transcriptOverride?: string) => {
-        speechServiceRef.current?.stop();
+        // If a transcript is already provided (from auto-stop callback), skip recording-stop.
+        // Otherwise, tell Rust to stop the mic — Whisper will still process asynchronously.
+        if (transcriptOverride === undefined) {
+            // User manually stopped — tell Rust to stop the mic.
+            // Whisper will process async; onAutoStop will call us again with the final text.
+            speechServiceRef.current?.stop();
+            setStatus("Transcribing...");
+            return; // Wait for SpeechService to fire onAutoStop(finalText)
+        }
+
+        setStatus("Processing...");
         setIsRecording(false);
         isRecordingRef.current = false;
-        setStatus("Processing...");
         
-        const textToProcess = transcriptOverride !== undefined ? transcriptOverride : rawTextRef.current;
+        const textToProcess = transcriptOverride;
         if (!textToProcess || textToProcess.trim().length === 0) {
             setStatus("Idle");
             return;
@@ -612,7 +618,7 @@ const Overlay: React.FC = () => {
                                 {history.length === 0 ? (
                                     <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '12px', opacity: 0.6 }}>No history yet</div>
                                 ) : (
-                                    history.map((item, i) => (
+                                    history.map((item) => (
                                         <div 
                                             key={item.timestamp} 
                                             onClick={() => {
